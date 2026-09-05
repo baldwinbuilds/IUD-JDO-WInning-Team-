@@ -48,7 +48,10 @@ class RunConfig:
     pseudo_weight: float = 0.5
     pseudo_T: float = 2.0
     pseudo_margin: float = 0.2
-    sinkhorn: bool = False                # balanced pseudo-label assignment (real test domain only)
+    sinkhorn: bool = False                # balanced pseudo-labels for domains with a known marginal (test: uniform)
+    sinkhorn_tau: float = 0.1             # Sinkhorn temperature for the pseudo-label posterior
+    sinkhorn_rank: str = "model"          # 'model': rank/weight reassigned rows by the model's own prob; 'q': by the balanced posterior
+    selftrain_guard: float = 0.0          # reject a round whose test-domain argmax agrees with the previous one below this (0 = off)
     seed: int = 0
 
     def to_dict(self):
@@ -100,6 +103,20 @@ def adabn_predict(model, Xt: torch.Tensor, Bt: torch.Tensor) -> np.ndarray:
     return out
 
 
+@torch.no_grad()
+def _swa_update(swa: torch.nn.Module, model: torch.nn.Module, n: int) -> None:
+    """Running mean (n previous updates) of every float parameter and float buffer - BatchNorm running
+    statistics included - and a copy of integer buffers (num_batches_tracked). Same semantics as
+    torch's AveragedModel(use_buffers=True) minus the integer-addcdiv error raised by torch >= 2.11."""
+    src = list(model.parameters()) + list(model.buffers())
+    dst = list(swa.parameters()) + list(swa.buffers())
+    for ps, pm in zip(dst, src):
+        if ps.dtype.is_floating_point:
+            ps.add_(pm.detach() - ps, alpha=1.0 / (n + 1))
+        else:
+            ps.copy_(pm)
+
+
 def _batches(n: int, batch_size: int, g: torch.Generator, weights: torch.Tensor | None):
     """Index batches for one epoch: weighted sampling with replacement (class-balanced) or a permutation."""
     if weights is not None:
@@ -146,13 +163,16 @@ def train_one(cfg: RunConfig, Xs, ys, bs, Xt, bt, n_domains: int = 10, device: s
     use_da = cfg.da in ("dann", "cdan", "coral")
     model = DriftNet(Xs_t.shape[1], C, n_domains, arch=cfg.arch, hidden=tuple(cfg.hidden), dropout=cfg.dropout,
                      da=cfg.da if cfg.da in ("dann", "cdan") else "none", k=cfg.k).to(dev)
+    if cfg.adabn and not any(isinstance(m, torch.nn.modules.batchnorm._BatchNorm) for m in model.modules()):
+        raise ValueError(f"{cfg.variant}: adabn=True but arch={cfg.arch} has no BatchNorm layers (AdaBN would be a no-op)")
     opt = torch.optim.AdamW(model.parameters(), lr=cfg.lr, weight_decay=cfg.wd)
     steps_per_epoch = max(1, len(Xs_t) // cfg.batch_size)
     total = cfg.epochs * steps_per_epoch
     sched = torch.optim.lr_scheduler.OneCycleLR(opt, max_lr=cfg.lr, total_steps=total, pct_start=0.1,
                                                 anneal_strategy="cos", div_factor=20, final_div_factor=100)
     swa_start = min(int(round(cfg.epochs * (1 - cfg.swa_frac))), cfg.epochs - 1)
-    swa_model = torch.optim.swa_utils.AveragedModel(model, use_buffers=True)   # BN buffers averaged too
+    swa = copy.deepcopy(model)      # running average of parameters AND float buffers (BN stats): _swa_update
+    n_averaged = 0
     history = []
     step = 0
     t0 = time.time()
@@ -191,7 +211,8 @@ def train_one(cfg: RunConfig, Xs, ys, bs, Xt, bt, n_domains: int = 10, device: s
             step += 1
             ep_loss += loss.item()
         if epoch >= swa_start:
-            swa_model.update_parameters(model)
+            _swa_update(swa, model, n_averaged)
+            n_averaged += 1
         if y_eval is not None and (epoch % 10 == 9 or epoch == cfg.epochs - 1):
             from drift.metrics import macro_f1
             p = predict_probs(model, Xt_t[:n_eval]).argmax(1) + 1
@@ -201,9 +222,8 @@ def train_one(cfg: RunConfig, Xs, ys, bs, Xt, bt, n_domains: int = 10, device: s
             if verbose:
                 print(f"    ep {epoch+1:3d} loss={ep_loss/steps_per_epoch:.3f} dom={ep_dom/steps_per_epoch:.3f} "
                       f"heldout_f1={f1:.3f} t={time.time()-t0:.0f}s", flush=True)
-    assert int(swa_model.n_averaged) > 0, "SWA never updated"
+    assert n_averaged > 0, "SWA never updated"
     probs_last = predict_probs(model, Xt_t)
-    swa = swa_model.module
     probs_swa_raw = predict_probs(swa, Xt_t)
     probs_last_adabn = adabn_predict(model, Xt_t, Bt) if cfg.adabn else None
     probs = adabn_predict(swa, Xt_t, Bt) if cfg.adabn else probs_swa_raw

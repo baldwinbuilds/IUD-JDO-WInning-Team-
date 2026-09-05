@@ -20,7 +20,12 @@ def load_train() -> pd.DataFrame:
 
 
 def load_test() -> pd.DataFrame:
-    return pd.read_csv(DATA / "test.csv")
+    df = pd.read_csv(DATA / "test.csv")
+    if len(df) != N_TEST:
+        import warnings
+        warnings.warn(f"data/test.csv has {len(df)} rows, expected {N_TEST}: this is NOT the full competition test file",
+                      stacklevel=2)
+    return df
 
 
 def load_sample_submission() -> pd.DataFrame:

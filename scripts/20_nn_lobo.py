@@ -46,10 +46,14 @@ VARIANTS = {
     "a2bl": dict(arch="mlp", da="cdan", lam_max=0.1, adabn=True),
     "a4b": dict(arch="mlp", da="coral", coral_w=1.0, adabn=True),
     "a5b": dict(arch="cnn", da="none", adabn=True, hidden=(256,)),
-    "a6b": dict(arch="tabm", da="none", adabn=True, hidden=(512, 512, 512)),
+    "a6": dict(arch="tabm", da="none", hidden=(512, 512, 512)),      # TabM has no BatchNorm: AdaBN impossible
     "a7b": dict(arch="mlp", da="none", adabn=True, selftrain_rounds=(0.5,)),
     "a7b3": dict(arch="mlp", da="none", adabn=True, selftrain_rounds=(0.3, 0.5, 0.7)),
     "a9b": dict(arch="mlp", da="none", adabn=True, selftrain_rounds=(0.3, 0.5, 0.7), sinkhorn=True),
+    # Sinkhorn pseudo-labels ranked/weighted by the balanced posterior (the prior actually acts), softer tau
+    "a9q": dict(arch="mlp", da="none", adabn=True, selftrain_rounds=(0.3, 0.5, 0.7), sinkhorn=True, sinkhorn_rank="q"),
+    "a9s": dict(arch="mlp", da="none", adabn=True, selftrain_rounds=(0.5, 0.7, 0.9), sinkhorn=True, sinkhorn_rank="q", sinkhorn_tau=0.4),
+    "a9t": dict(arch="mlp", da="none", adabn=True, selftrain_rounds=(0.5, 0.7, 0.9), sinkhorn=True, sinkhorn_rank="q", sinkhorn_tau=1.0),
     "a3w": dict(arch="mlp", da="none", adabn=True, hidden=(1024, 1024, 1024), dropout=0.25),
     "a3nb": dict(arch="mlp", da="none", adabn=True, balanced=False),
 }
@@ -64,7 +68,7 @@ def main():
     ap.add_argument("--blocks", nargs="+", default=list(DEFAULT_NN))
     ap.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     ap.add_argument("--tag", default="nn")
-    ap.add_argument("--threads", type=int, default=0)
+    ap.add_argument("--threads", type=int, default=2, help="torch CPU threads (GPU runs need few; 0 = torch default)")
     ap.add_argument("--overwrite", action="store_true")
     ap.add_argument("--verbose", action="store_true")
     args = ap.parse_args()
@@ -110,9 +114,10 @@ def main():
                 probs = res["probs"]
                 extra = {}
                 if cfg.selftrain_rounds:
+                    held_marg = np.bincount(y_eval - 1, minlength=6) if y_eval is not None else None
                     st = self_train(cfg, arr["Xs"], arr["ys"], arr["bs"], arr["Xt"], arr["bt"], probs,
                                     n_domains=10, device=args.device, y_eval=y_eval, n_eval=n_eval or None,
-                                    verbose=args.verbose, log=log)
+                                    verbose=args.verbose, log=log, heldout_marginal=held_marg)
                     extra["probs_base"] = probs
                     probs = st["probs"]
                     extra["selftrain"] = json.dumps(st["rounds"])

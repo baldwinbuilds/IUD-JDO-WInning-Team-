@@ -180,7 +180,7 @@ def adabn(model: nn.Module, x_target: torch.Tensor, max_chunk: int = 8192) -> No
     (domains here are <= 3,613 rows); only domains larger than max_chunk are split (cumulative average)."""
     bns = [m for m in model.modules() if isinstance(m, nn.modules.batchnorm._BatchNorm)]
     if not bns:
-        return
+        raise ValueError("adabn(): model has no BatchNorm layers")
     for m in bns:
         m.reset_running_stats()
         m.momentum = None      # cumulative average
