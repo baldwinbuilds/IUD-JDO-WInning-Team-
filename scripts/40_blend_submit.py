@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import sys
 from collections import defaultdict
 from pathlib import Path
@@ -36,7 +37,8 @@ FOLDS = (6, 7, 8, 9)
 EPS = 1e-9
 
 
-def load_models(nn_tag: str, trackb_variants, nn_variants, fold0_weight: float):
+def load_models(nn_tag: str, trackb_variants, nn_variants, fold0_weight: float, alts: bool = False,
+                test_models: str = "all"):
     """Return dict name -> {'oof': {k: probs}, 'test': probs}, y dict k -> labels (1..6)."""
     models, y = {}, {}
     tb = RUNS / "trackB"
@@ -52,6 +54,8 @@ def load_models(nn_tag: str, trackb_variants, nn_variants, fold0_weight: float):
                 m["oof"][k] = z[v]
                 y[k] = z["y"].astype(int)
             models[f"trackB:{v}"] = m
+    if nn_variants and any("@" in v for v in nn_variants):
+        alts = True
     nd = RUNS / nn_tag
     if nd.exists():
         oof = defaultdict(lambda: defaultdict(list))
@@ -59,15 +63,26 @@ def load_models(nn_tag: str, trackb_variants, nn_variants, fold0_weight: float):
         for f in sorted(nd.glob("*_fold*_seed*.npz")):
             z = np.load(f, allow_pickle=True)
             v, k = str(z["variant"]), int(z["fold"])
+            if nn_variants and v not in nn_variants and not any(x.startswith(v + "@") for x in nn_variants):
+                continue
+            variants = [(v, "oof", "test")]
+            if alts:
+                for key in z.files:
+                    if key.startswith("alt_") and key.endswith("_oof") and not key.endswith("last_oof") and not key.endswith("last_adabn_oof"):
+                        name = key[len("alt_"):-len("_oof")]
+                        if not np.array_equal(z["oof"], z[key]) or not np.array_equal(z["test"], z[f"alt_{name}_test"]):
+                            variants.append((f"{v}@{name}", key, f"alt_{name}_test"))
+            for vv, ko, kt in variants:
+                if k in FOLDS:
+                    oof[vv][k].append(z[ko])
+                    y[k] = z["y_oof"].astype(int)
+                if test_models == "all" or (test_models == "lobo" and k in FOLDS) or (test_models == "fold0" and k == 0):
+                    test[vv].append(z[kt])
+                    tw[vv].append(fold0_weight if k == 0 else 1.0)
+        for v in oof:
             if nn_variants and v not in nn_variants:
                 continue
-            if k in FOLDS:
-                oof[v][k].append(z["oof"])
-                y[k] = z["y_oof"].astype(int)
-            test[v].append(z["test"])
-            tw[v].append(fold0_weight if k == 0 else 1.0)
-        for v in oof:
-            if all(k in oof[v] for k in FOLDS):
+            if all(k in oof[v] for k in FOLDS) and test[v]:
                 w = np.asarray(tw[v]) / np.sum(tw[v])
                 models[f"nn:{v}"] = {"oof": {k: np.mean(oof[v][k], axis=0) for k in FOLDS},
                                      "test": np.tensordot(w, np.stack(test[v]), axes=1),
@@ -75,6 +90,10 @@ def load_models(nn_tag: str, trackb_variants, nn_variants, fold0_weight: float):
                                      "n_seeds": {k: len(oof[v][k]) for k in FOLDS}}
             else:
                 print(f"  (skipping nn:{v}: folds present {sorted(oof[v])}, need {FOLDS})")
+    missing = [f"nn:{v}" for v in (nn_variants or []) if f"nn:{v}" not in models]
+    missing += [f"trackB:{v}" for v in (trackb_variants or []) if f"trackB:{v}" not in models]
+    if missing:
+        sys.exit(f"requested members not found: {missing} (an @alt member needs alt_<name>_oof/test in the run files; see 'skipping' lines for fold gaps)")
     return models, y
 
 
@@ -128,49 +147,81 @@ def score(models, y, weights: dict, temps, assign: str, tau: float):
     return weighted_score(per), per, per_pre
 
 
-def hill_climb(models, y, temps, assign, tau, n_iter: int = 40):
+def objective(models, y, weights, temps, assign, tau, hist_penalty: float):
+    """Proxy score minus a label-free penalty: L1 distance of the blend's UNFORCED test histogram to the
+    stated 600-per-class prior (uses only unlabeled test features; the proxies saturate and cannot see
+    the Ethanol/Acetaldehyde leakage, the histogram can)."""
+    s = score(models, y, weights, temps, assign, tau)[0]
+    if hist_penalty:
+        s -= hist_penalty * hist_l1(blend(models, weights, "test", temps).argmax(1))
+    return s
+
+
+def hill_climb(models, y, temps, assign, tau, hist_penalty: float = 0.0, n_iter: int = 40):
+    """Greedy coordinate ascent on integer member counts, started from (a) the best single member and
+    (b) equal weights; the better end point wins (the greedy path from a single member often cannot
+    reach the equal-weight mixture)."""
     names = list(models)
     singles = {m: score(models, y, {m: 1.0}, temps, assign, tau) for m in names}
+
+    def climb(counts):
+        counts = defaultdict(int, counts)
+        tot = sum(counts.values())
+        cur = objective(models, y, {m: c / tot for m, c in counts.items()}, temps, assign, tau, hist_penalty)
+        for _ in range(n_iter):
+            cand = {}
+            for m in names:
+                c = defaultdict(int, counts)
+                c[m] += 1
+                tot = sum(c.values())
+                cand[m] = objective(models, y, {mm: cc / tot for mm, cc in c.items()}, temps, assign, tau, hist_penalty)
+            m = max(cand, key=cand.get)
+            if cand[m] < cur + 1e-5:
+                break
+            counts[m] += 1
+            cur = cand[m]
+        tot = sum(counts.values())
+        return {m: c / tot for m, c in counts.items() if c > 0}, cur
+
     best = max(singles, key=lambda m: singles[m][0])
-    counts = defaultdict(int)
-    counts[best] += 1
-    cur = singles[best][0]
-    for _ in range(n_iter):
-        cand = {}
-        for m in names:
-            c = defaultdict(int, counts)
-            c[m] += 1
-            tot = sum(c.values())
-            cand[m] = score(models, y, {mm: cc / tot for mm, cc in c.items()}, temps, assign, tau)[0]
-        m = max(cand, key=cand.get)
-        if cand[m] < cur + 1e-5:
-            break
-        counts[m] += 1
-        cur = cand[m]
-    tot = sum(counts.values())
-    return {m: c / tot for m, c in counts.items()}, singles
+    w1, s1 = climb({best: 1})
+    w2, s2 = climb({m: 1 for m in names})
+    print(f"hill-climb objective (proxy score - {hist_penalty} x test hist_l1) from best single: {s1:.4f} | from equal weights: {s2:.4f}")
+    return (w1 if s1 >= s2 else w2), singles
 
 
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--nn-tag", default="nn")
-    ap.add_argument("--trackb", nargs="*", default=["ens_cbstb", "em_ensb", "lda_em", "ens_cbst"])
+    ap.add_argument("--trackb", nargs="*", default=["ens_cbstb", "em_ensb", "lda_em"],
+                    help="Track B members (plain ens_cbst is excluded by default: its self-training amplifies the test skew)")
+    ap.add_argument("--hist-penalty", type=float, default=0.05,
+                    help="weight of the label-free test-histogram L1 penalty in the blend objective (0 = proxies only)")
     ap.add_argument("--nn", nargs="*", default=None, help="restrict NN variants (default: all with folds 6,7,8,9)")
+    ap.add_argument("--no-nn", action="store_true", help="Track B members only")
     ap.add_argument("--assign", choices=["sinkhorn", "hungarian", "none"], default="sinkhorn")
     ap.add_argument("--tau", type=float, default=1.0)
     ap.add_argument("--no-calib", action="store_true", help="skip per-member temperature calibration")
     ap.add_argument("--fold0-weight", type=float, default=2.0)
+    ap.add_argument("--alts", action="store_true", help="also offer nn:<variant>@<alt> members (other read-outs of the same nets, e.g. @adabn)")
+    ap.add_argument("--test-models", choices=["all", "lobo", "fold0"], default="all",
+                    help="which nets' test predictions are averaged per nn member: all folds, folds 6-9 only, or fold-0 nets only")
     ap.add_argument("--equal", action="store_true", help="equal weights over all members instead of hill-climb")
     ap.add_argument("--force", action="store_true")
     ap.add_argument("--name", default="final")
     args = ap.parse_args()
-    models, y = load_models(args.nn_tag, args.trackb, args.nn, args.fold0_weight)
+    models, y = load_models("__no_nn__" if args.no_nn else args.nn_tag, args.trackb, args.nn, args.fold0_weight, args.alts, args.test_models)
     if not models:
         sys.exit("no models found")
     print("members:", ", ".join(f"{m}" + (f"[{d['n_test_models']} test nets]" if "n_test_models" in d else "") for m, d in models.items()))
     temps = calibrate(models, y, not args.no_calib)
     print("temperatures (fitted on all folds):", {m: round(t["test"], 2) for m, t in temps.items()})
-    weights, singles = hill_climb(models, y, temps, args.assign, args.tau)
+    for m, d in models.items():                      # sharpness check: OOF stack vs pooled test after the test temperature
+        T = temps[m]["test"]
+        oofP = np.vstack([d["oof"][k] for k in FOLDS])
+        sharp = lambda P: float(np.exp(np.log(np.clip(P, EPS, 1)) / T).max(1).mean() / np.exp(np.log(np.clip(P, EPS, 1)) / T).sum(1).mean())
+        print(f"  {m:22s} T={T:.2f} mean max-prob after T: oof {sharp(oofP):.3f} | test {sharp(d['test']):.3f}")
+    weights, singles = hill_climb(models, y, temps, args.assign, args.tau, args.hist_penalty)
     print(f"\nsingle members: weighted post-assignment macro-F1 over folds {FOLDS} (weights {PROXY_WEIGHTS}); per fold post / pre")
     for m, (s, per, pre) in sorted(singles.items(), key=lambda t: -t[1][0]):
         print(f"  {m:20s} {s:.4f}  " + " ".join(f"b{k} {per[k]:.3f}/{pre[k]:.3f}" for k in FOLDS))
@@ -221,9 +272,14 @@ def main():
         problems.append(f"agreement with best single member {best_single} is {agree[best_single]['post']:.3f} < 0.75")
     for p in problems:
         print("GATE:", p)
-    existing = sorted(SUBS.glob(f"sub_{args.name}_v*.csv"))
-    n = len(existing) + 1
+    pat = re.compile(rf"^(?:sub|blend)_{re.escape(args.name)}_v(\d+)(?:\.csv|\.json|_test_probs\.npy)$")
+    cands = (list(SUBS.glob(f"sub_{args.name}_v*.csv")) + list(REPORTS.glob(f"blend_{args.name}_v*.json"))
+             + list(RUNS.glob(f"blend_{args.name}_v*_test_probs.npy")))
+    n = max([int(mm.group(1)) for p in cands if (mm := pat.match(p.name))], default=0) + 1
     path = SUBS / f"sub_{args.name}_v{n}.csv"
+    for p in (path, REPORTS / f"blend_{args.name}_v{n}.json", RUNS / f"blend_{args.name}_v{n}_test_probs.npy"):
+        if p.exists():
+            sys.exit(f"refusing to overwrite {p}")
     report = {"weights": weights, "temperatures": {m: t["test"] for m, t in temps.items()}, "assign": args.assign,
               "tau": args.tau, "score_post": hc_w, "per_fold_post": hc_per, "per_fold_pre": hc_pre,
               "singles": {m: s[0] for m, s in singles.items()}, "test_hist_pre": hist_pre,

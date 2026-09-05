@@ -65,10 +65,12 @@ def lda_em(Xs, ys, Xt, prior=None, iters: int = 10, trust: float = 1.0, shrinkag
     Sw = R.T @ R / len(R) + 1e-6 * np.eye(Zs.shape[1])
     Si = np.linalg.inv(Sw)
     pi = np.full(C, 1.0 / C) if prior is None else np.asarray(prior, float) / np.sum(prior)
+    active = pi > 0                                   # classes absent from the marginal stay frozen
+    logpi = np.where(active, np.log(np.where(active, pi, 1.0)), -np.inf)
 
     def posterior(m):
         d = Zt[:, None, :] - m[None, :, :]
-        ll = -0.5 * np.einsum("ncd,de,nce->nc", d, Si, d) + np.log(pi)[None, :]
+        ll = -0.5 * np.einsum("ncd,de,nce->nc", d, Si, d) + logpi[None, :]
         ll -= ll.max(1, keepdims=True)
         p = np.exp(ll)
         return p / p.sum(1, keepdims=True)
@@ -82,7 +84,7 @@ def lda_em(Xs, ys, Xt, prior=None, iters: int = 10, trust: float = 1.0, shrinkag
         step = new - m
         dist = np.sqrt(np.einsum("cd,de,ce->c", step, Si, step))
         scale = np.minimum(1.0, trust / np.maximum(dist, 1e-12))
-        m = m + step * scale[:, None]
+        m[active] = (m + step * scale[:, None])[active]
     return P0, posterior(m), classes
 
 

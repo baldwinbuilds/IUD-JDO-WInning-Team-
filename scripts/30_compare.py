@@ -30,6 +30,7 @@ def main():
     ap.add_argument("--tag", default="nn")
     ap.add_argument("--extra", nargs="*", default=[], help="other run dirs to include, e.g. trackB")
     ap.add_argument("--tau", type=float, default=1.0)
+    ap.add_argument("--no-alts", dest="alts", action="store_false", help="hide the <variant>@<alt> read-out rows")
     args = ap.parse_args()
     files = sorted((RUNS / args.tag).glob("*_fold*_seed*.npz"))
     if not files:
@@ -45,6 +46,16 @@ def main():
             oof[v][k].append(z["oof"])
             y_of[k] = z["y_oof"].astype(int)
         test_probs[v].append(z["test"])
+        if args.alts:                                  # other read-outs of the same network (e.g. @swa_raw / @adabn)
+            for key in z.files:
+                if key.startswith("alt_") and key.endswith("_oof") and not key.endswith("last_oof") and not key.endswith("last_adabn_oof"):
+                    name = key[len("alt_"):-len("_oof")]
+                    if np.array_equal(z["oof"], z[key]) and np.array_equal(z["test"], z[f"alt_{name}_test"]):
+                        continue
+                    va = f"{v}@{name}"
+                    if k > 0:
+                        oof[va][k].append(z[key])
+                    test_probs[va].append(z[f"alt_{name}_test"])
         if "validators" in z:
             validators[v].append(json.loads(str(z["validators"])))
     rows = []

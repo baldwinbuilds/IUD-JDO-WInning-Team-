@@ -51,7 +51,6 @@ VARIANTS = {
     "a7b3": dict(arch="mlp", da="none", adabn=True, selftrain_rounds=(0.3, 0.5, 0.7)),
     "a9b": dict(arch="mlp", da="none", adabn=True, selftrain_rounds=(0.3, 0.5, 0.7), sinkhorn=True),
     # Sinkhorn pseudo-labels ranked/weighted by the balanced posterior (the prior actually acts), softer tau
-    "a9q": dict(arch="mlp", da="none", adabn=True, selftrain_rounds=(0.3, 0.5, 0.7), sinkhorn=True, sinkhorn_rank="q"),
     "a9s": dict(arch="mlp", da="none", adabn=True, selftrain_rounds=(0.5, 0.7, 0.9), sinkhorn=True, sinkhorn_rank="q", sinkhorn_tau=0.4),
     "a9t": dict(arch="mlp", da="none", adabn=True, selftrain_rounds=(0.5, 0.7, 0.9), sinkhorn=True, sinkhorn_rank="q", sinkhorn_tau=1.0),
     "a3w": dict(arch="mlp", da="none", adabn=True, hidden=(1024, 1024, 1024), dropout=0.25),
@@ -113,6 +112,9 @@ def main():
                                 device=args.device, y_eval=y_eval, n_eval=n_eval or None, verbose=args.verbose)
                 probs = res["probs"]
                 extra = {}
+                alts = {"last": res["probs_last"], "last_adabn": res.get("probs_last_adabn")}
+                if cfg.adabn:
+                    alts["swa_raw"] = res.get("probs_swa_raw")   # the same network read out with running BN statistics
                 if cfg.selftrain_rounds:
                     held_marg = np.bincount(y_eval - 1, minlength=6) if y_eval is not None else None
                     st = self_train(cfg, arr["Xs"], arr["ys"], arr["bs"], arr["Xt"], arr["bt"], probs,
@@ -121,6 +123,8 @@ def main():
                     extra["probs_base"] = probs
                     probs = st["probs"]
                     extra["selftrain"] = json.dumps(st["rounds"])
+                    if st["alt"] is not None:
+                        alts = st["alt"]          # alternatives of the final (self-trained) model
                 oof = probs[:n_eval] if n_eval else np.zeros((0, 6))
                 tst = probs[n_eval:]
                 val = {"bnm": bnm(tst), "im": info_max(tst), "ami": class_ami(tst, arr["Xt"][n_eval:], seed=seed)}
@@ -131,11 +135,11 @@ def main():
                     f1 = macro_f1(y_eval, oof.argmax(1) + 1)
                     pcf = per_class_f1(y_eval, oof.argmax(1) + 1)
                     msg += f" | heldout batch{k} macroF1={f1:.4f} per-class={np.round(pcf, 3).tolist()}"
-                    alts = {"last": res["probs_last"], "swa_raw": res.get("probs_swa_raw"), "last_adabn": res.get("probs_last_adabn")}
                     msg += " | alt heldout F1: " + " ".join(f"{a}={macro_f1(y_eval, P[:n_eval].argmax(1)+1):.4f}" for a, P in alts.items() if P is not None)
-                for a in ("probs_last", "probs_swa_raw", "probs_last_adabn"):
-                    if res.get(a) is not None:
-                        extra[a.replace("probs_", "alt_")] = res[a]
+                for a, P in alts.items():          # sliced like oof/test so they can serve as extra blend members
+                    if P is not None:
+                        extra[f"alt_{a}_oof"] = P[:n_eval] if n_eval else np.zeros((0, 6))
+                        extra[f"alt_{a}_test"] = P[n_eval:]
                 log(msg)
                 np.savez_compressed(path, oof=oof, test=tst, y_oof=(y_eval if y_eval is not None else np.zeros(0)),
                                     fold=k, seed=seed, variant=v, config=json.dumps(cfg.to_dict()),

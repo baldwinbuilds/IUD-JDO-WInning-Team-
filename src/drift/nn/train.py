@@ -52,6 +52,9 @@ class RunConfig:
     sinkhorn_tau: float = 0.1             # Sinkhorn temperature for the pseudo-label posterior
     sinkhorn_rank: str = "model"          # 'model': rank/weight reassigned rows by the model's own prob; 'q': by the balanced posterior
     selftrain_guard: float = 0.0          # reject a round whose test-domain argmax agrees with the previous one below this (0 = off)
+    selftrain_output: str = "swa_raw"     # teacher/primary output of self-trained rounds: 'swa_raw' (running BN stats; pseudo rows were
+                                          # trained in source-normalised coordinates, re-estimating BN on the target double-counts the
+                                          # shift: fold 9 .85 vs .99) or 'adabn'
     seed: int = 0
 
     def to_dict(self):
