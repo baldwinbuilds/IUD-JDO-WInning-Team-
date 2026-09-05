@@ -97,6 +97,9 @@ def main():
                     log(f"skip {path.name} (exists)")
                     continue
                 cfg = RunConfig(variant=v, seed=seed, blocks=tuple(args.blocks), **VARIANTS[v])
+                if cfg.arch == "cnn":
+                    names = arr["names"]
+                    assert names[0].startswith("slog_s0_") and names[128].startswith("pat_s0_"),                         "cnn expects blocks to start with slog then pattern (16x8 each)"
                 if args.epochs:
                     cfg.epochs = args.epochs
                 t0 = time.time()

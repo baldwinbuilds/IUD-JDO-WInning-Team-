@@ -25,11 +25,14 @@ def sinkhorn_balanced(P: np.ndarray, tau: float = 0.1, n_iter: int = 100) -> np.
     return Q
 
 
-def select_pseudo(P: np.ndarray, frac: float, margin_min: float):
-    """Top `frac` most confident rows per predicted class (margin filtered). Returns local idx, conf."""
+def select_pseudo(P: np.ndarray, frac: float, margin_min: float, conf_src: np.ndarray | None = None):
+    """Top `frac` rows per predicted class of P (margin filtered on P). Ranking/weight confidence =
+    conf_src[i, argmax P[i]] when given (model probability of the assigned class; needed when P is a
+    near-one-hot Sinkhorn assignment), else max P. Returns local idx, conf."""
     pred = P.argmax(1)
     srt = np.sort(P, axis=1)
-    conf, margin = srt[:, -1], srt[:, -1] - srt[:, -2]
+    margin = srt[:, -1] - srt[:, -2]
+    conf = srt[:, -1] if conf_src is None else conf_src[np.arange(len(P)), pred]
     sel = []
     for c in range(P.shape[1]):
         idx = np.where((pred == c) & (margin >= margin_min))[0]
@@ -48,15 +51,17 @@ def self_train(cfg: RunConfig, Xs, ys, bs, Xt, bt, base_probs: np.ndarray, n_dom
     P = np.asarray(base_probs, np.float64)
     out = {"rounds": []}
     for r, frac in enumerate(cfg.selftrain_rounds):
+        T = cfg.pseudo_T if r == 0 else 1.0    # later teachers already reproduce softened targets: no compounding
         idx_all, Q_all, W_all = [], [], []
         for d in np.unique(bt):
             m = np.where(bt == d)[0]
             Pd = P[m]
-            src = sinkhorn_balanced(Pd) if (cfg.sinkhorn and d == TEST_DOMAIN) else Pd
-            loc, conf = select_pseudo(src, frac, cfg.pseudo_margin)
+            use_sk = cfg.sinkhorn and d == TEST_DOMAIN
+            src = sinkhorn_balanced(Pd) if use_sk else Pd
+            loc, conf = select_pseudo(src, frac, cfg.pseudo_margin, conf_src=Pd if use_sk else None)
             idx_all.append(m[loc])
-            Q_all.append(soften(Pd[loc], cfg.pseudo_T))     # soft targets from the model's probabilities
-            W_all.append(cfg.pseudo_weight * conf)
+            Q_all.append(soften(src[loc], T))       # target = the (balanced) posterior the row was selected under
+            W_all.append(cfg.pseudo_weight * conf)  # weight = model's own probability of that class
         idx = np.concatenate(idx_all)
         Q = np.vstack(Q_all)
         W = np.concatenate(W_all)

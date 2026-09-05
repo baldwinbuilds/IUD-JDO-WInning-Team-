@@ -90,7 +90,7 @@ class CNNEncoder(nn.Module):
 
     def __init__(self, in_dim: int, n_grid: int = 256, hidden: int = 256, dropout: float = 0.15):
         super().__init__()
-        assert n_grid % 16 == 0
+        assert n_grid % 128 == 0, "n_grid must be whole 16x8 sensor-major blocks"
         self.n_grid = n_grid
         c = n_grid // 16
         self.conv = nn.Sequential(
@@ -175,9 +175,9 @@ class DriftNet(nn.Module):
 
 # ------------------------------------------------------------------- test-time BN
 @torch.no_grad()
-def adabn(model: nn.Module, x_target: torch.Tensor, max_chunk: int = 2048) -> None:
-    """Recompute BatchNorm running statistics on ONE target domain (AdaBN). Cumulative average over
-    chunks of >= max_chunk/2 rows (never a 1-row chunk); order-free."""
+def adabn(model: nn.Module, x_target: torch.Tensor, max_chunk: int = 8192) -> None:
+    """Recompute BatchNorm running statistics on ONE target domain (AdaBN) in a single exact pass
+    (domains here are <= 3,613 rows); only domains larger than max_chunk are split (cumulative average)."""
     bns = [m for m in model.modules() if isinstance(m, nn.modules.batchnorm._BatchNorm)]
     if not bns:
         return
