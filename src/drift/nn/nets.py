@@ -105,7 +105,10 @@ class CNNEncoder(nn.Module):
         self.out_dim = hidden
 
     def forward(self, x):
-        g = x[:, : self.n_grid].reshape(len(x), 16, -1).transpose(1, 2)   # (B, c, 16 sensors)
+        B = len(x)
+        nb = self.n_grid // 128                                    # number of sensor-major 16x8 blocks (slog, pattern)
+        g = x[:, : self.n_grid].reshape(B, nb, 16, 8)              # (B, block, sensor, descriptor)
+        g = g.permute(0, 1, 3, 2).reshape(B, nb * 8, 16)           # (B, channels=block*descriptor, 16 sensors)
         h = self.conv(g)
         pooled = torch.cat([h.mean(2), h.amax(2), x[:, self.n_grid:]], dim=1)
         return self.head(pooled)
@@ -152,7 +155,7 @@ class DriftNet(nn.Module):
             f = f.mean(1)
             logits = logits.mean(1)
         if self.da == "cdan":
-            p = F.softmax(logits, dim=1)
+            p = F.softmax(logits, dim=1).detach()   # condition on predictions; never train the head adversarially
             f = torch.bmm(f.unsqueeze(2), p.unsqueeze(1)).flatten(1)   # multilinear map (B, d*C)
         f = grad_reverse(f, lam)   # reversal wraps the whole discriminator input
         return self.disc(f)
@@ -172,8 +175,9 @@ class DriftNet(nn.Module):
 
 # ------------------------------------------------------------------- test-time BN
 @torch.no_grad()
-def adabn(model: nn.Module, x_target: torch.Tensor, batch_size: int = 1024) -> None:
-    """Recompute BatchNorm running statistics on the target domain (AdaBN)."""
+def adabn(model: nn.Module, x_target: torch.Tensor, max_chunk: int = 2048) -> None:
+    """Recompute BatchNorm running statistics on ONE target domain (AdaBN). Cumulative average over
+    chunks of >= max_chunk/2 rows (never a 1-row chunk); order-free."""
     bns = [m for m in model.modules() if isinstance(m, nn.modules.batchnorm._BatchNorm)]
     if not bns:
         return
@@ -185,6 +189,8 @@ def adabn(model: nn.Module, x_target: torch.Tensor, batch_size: int = 1024) -> N
     for m in model.modules():   # dropout off during the statistics pass
         if isinstance(m, nn.Dropout):
             m.eval()
-    for i in range(0, len(x_target), batch_size):
-        model(x_target[i:i + batch_size])
+    n = len(x_target)
+    n_chunks = max(1, math.ceil(n / max_chunk))
+    for idx in torch.tensor_split(torch.arange(n, device=x_target.device), n_chunks):
+        model(x_target[idx])
     model.train(was_training)

@@ -59,3 +59,25 @@ def sanity_check(pred, n_expected: int, lo: int = 520, hi: int = 680) -> list:
     if set(np.unique(pred).tolist()) - set(CLASSES.tolist()):
         problems.append("labels outside 1..6")
     return problems
+
+
+# ---- label-free validators for the unlabeled target (Musgrave et al. 2022: BNM / IM / ClassAMI rank well)
+def bnm(P: np.ndarray) -> float:
+    """Batch nuclear-norm of the prediction matrix, normalised by sqrt(N); higher = more confident AND diverse."""
+    return float(np.linalg.norm(P, "nuc") / np.sqrt(len(P)))
+
+
+def info_max(P: np.ndarray) -> float:
+    """H(mean prediction) - mean H(prediction); higher = confident per row, balanced overall."""
+    eps = 1e-9
+    h_mean = -(P.mean(0) * np.log(P.mean(0) + eps)).sum()
+    mean_h = -(P * np.log(P + eps)).sum(1).mean()
+    return float(h_mean - mean_h)
+
+
+def class_ami(P: np.ndarray, F: np.ndarray, k: int = 6, seed: int = 0) -> float:
+    """Adjusted mutual information between argmax predictions and a k-means clustering of the target features."""
+    from sklearn.cluster import KMeans
+    from sklearn.metrics import adjusted_mutual_info_score
+    lab = KMeans(k, n_init=4, random_state=seed).fit_predict(F)
+    return float(adjusted_mutual_info_score(P.argmax(1), lab))

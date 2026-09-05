@@ -25,26 +25,33 @@ import torch
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 from drift.data import RUNS, load_test, load_train  # noqa: E402
 from drift.features import DEFAULT_NN  # noqa: E402
-from drift.metrics import macro_f1, per_class_f1, pred_hist  # noqa: E402
+from drift.metrics import bnm, class_ami, info_max, macro_f1, per_class_f1, pred_hist  # noqa: E402
 from drift.nn.data import build_arrays  # noqa: E402
 from drift.nn.selftrain import self_train  # noqa: E402
 from drift.nn.train import RunConfig, train_one  # noqa: E402
 
 VARIANTS = {
+    # reference / ablations
     "a0": dict(arch="mlp", da="none"),
+    "a0nb": dict(arch="mlp", da="none", balanced=False),
     "a1": dict(arch="mlp", da="dann", lam_max=0.3),
-    "a1h": dict(arch="mlp", da="dann", lam_max=1.0),
     "a1l": dict(arch="mlp", da="dann", lam_max=0.1),
     "a2": dict(arch="mlp", da="cdan", lam_max=0.3),
+    "a4": dict(arch="mlp", da="coral", coral_w=1.0),
+    # AdaBN family (test-domain BatchNorm statistics) - proxy-validated: fold8 .93 -> .956
     "a3": dict(arch="mlp", da="none", adabn=True),
     "a3d": dict(arch="mlp", da="dann", lam_max=0.3, adabn=True),
-    "a4": dict(arch="mlp", da="coral", coral_w=1.0),
-    "a5": dict(arch="cnn", da="dann", lam_max=0.3, hidden=(256,)),
-    "a6": dict(arch="tabm", da="dann", lam_max=0.3, hidden=(512, 512, 512)),
-    "a7": dict(arch="mlp", da="dann", lam_max=0.3, selftrain_rounds=(0.3, 0.5, 0.7)),
-    "a7s": dict(arch="mlp", da="dann", lam_max=0.3, selftrain_rounds=(0.5,)),
-    "a9": dict(arch="mlp", da="dann", lam_max=0.3, selftrain_rounds=(0.3, 0.5, 0.7), sinkhorn=True),
-    "a0nb": dict(arch="mlp", da="none", balanced=False),
+    "a3dl": dict(arch="mlp", da="dann", lam_max=0.1, adabn=True),
+    "a2b": dict(arch="mlp", da="cdan", lam_max=0.3, adabn=True),
+    "a2bl": dict(arch="mlp", da="cdan", lam_max=0.1, adabn=True),
+    "a4b": dict(arch="mlp", da="coral", coral_w=1.0, adabn=True),
+    "a5b": dict(arch="cnn", da="none", adabn=True, hidden=(256,)),
+    "a6b": dict(arch="tabm", da="none", adabn=True, hidden=(512, 512, 512)),
+    "a7b": dict(arch="mlp", da="none", adabn=True, selftrain_rounds=(0.5,)),
+    "a7b3": dict(arch="mlp", da="none", adabn=True, selftrain_rounds=(0.3, 0.5, 0.7)),
+    "a9b": dict(arch="mlp", da="none", adabn=True, selftrain_rounds=(0.3, 0.5, 0.7), sinkhorn=True),
+    "a3w": dict(arch="mlp", da="none", adabn=True, hidden=(1024, 1024, 1024), dropout=0.25),
+    "a3nb": dict(arch="mlp", da="none", adabn=True, balanced=False),
 }
 
 
@@ -108,13 +115,19 @@ def main():
                     extra["selftrain"] = json.dumps(st["rounds"])
                 oof = probs[:n_eval] if n_eval else np.zeros((0, 6))
                 tst = probs[n_eval:]
-                msg = f"   done in {time.time()-t0:.0f}s | test hist={pred_hist(tst.argmax(1)+1).tolist()}"
+                val = {"bnm": bnm(tst), "im": info_max(tst), "ami": class_ami(tst, arr["Xt"][n_eval:], seed=seed)}
+                extra["validators"] = json.dumps(val)
+                msg = (f"   done in {time.time()-t0:.0f}s | test hist={pred_hist(tst.argmax(1)+1).tolist()}"
+                       f" | test validators BNM={val['bnm']:.3f} IM={val['im']:.3f} ClassAMI={val['ami']:.3f}")
                 if n_eval:
                     f1 = macro_f1(y_eval, oof.argmax(1) + 1)
                     pcf = per_class_f1(y_eval, oof.argmax(1) + 1)
                     msg += f" | heldout batch{k} macroF1={f1:.4f} per-class={np.round(pcf, 3).tolist()}"
-                    if res["history"]:
-                        msg += f" | last-epoch f1={res['history'][-1]['f1_heldout']:.4f}"
+                    alts = {"last": res["probs_last"], "swa_raw": res.get("probs_swa_raw"), "last_adabn": res.get("probs_last_adabn")}
+                    msg += " | alt heldout F1: " + " ".join(f"{a}={macro_f1(y_eval, P[:n_eval].argmax(1)+1):.4f}" for a, P in alts.items() if P is not None)
+                for a in ("probs_last", "probs_swa_raw", "probs_last_adabn"):
+                    if res.get(a) is not None:
+                        extra[a.replace("probs_", "alt_")] = res[a]
                 log(msg)
                 np.savez_compressed(path, oof=oof, test=tst, y_oof=(y_eval if y_eval is not None else np.zeros(0)),
                                     fold=k, seed=seed, variant=v, config=json.dumps(cfg.to_dict()),

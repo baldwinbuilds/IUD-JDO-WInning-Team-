@@ -1,0 +1,37 @@
+{
+ "weights": {
+  "trackB:ens_cbst": 1.0
+ },
+ "bias": [
+  -0.6000000000000001,
+  0.19999999999999973,
+  -0.30000000000000016,
+  -0.6000000000000001,
+  -0.30000000000000016,
+  0.3999999999999997
+ ],
+ "score_weighted_678": 0.9809583760906075,
+ "per_batch": {
+  "6": 0.9883859997752332,
+  "7": 0.996160783367061,
+  "8": 0.9620421569718413
+ },
+ "singles": {
+  "trackB:ens_cbst": 0.9809583760906075,
+  "trackB:lda_cbst": 0.9795560410606381
+ },
+ "test_hist": [
+  927,
+  547,
+  544,
+  288,
+  569,
+  725
+ ],
+ "problems": [
+  "class 1 (EtOH) predicted 927 times, outside [520,680]",
+  "class 4 (Acetal) predicted 288 times, outside [520,680]",
+  "class 6 (Tolu) predicted 725 times, outside [520,680]"
+ ],
+ "prior": "none"
+}
