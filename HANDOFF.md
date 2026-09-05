@@ -1,6 +1,6 @@
 # HANDOFF — Inter-uni Datathon Stream 3 (gas-sensor drift, batch 10)
 
-Updated 2026-09-05 ~21:00 local on the GPU desktop (RTX 3060 Ti). Everything below was verified in-session
+Updated 2026-09-05 ~23:30 local on the GPU desktop (RTX 3060 Ti). **Deliverable: `submissions/submission_final.csv`** (alternate: `submission_alternate.csv`; fallback: `sub_trackB_ot_v1.csv`). The root-level `submission.csv` is the teammate's old 2,288-row file — do not upload it. Everything below was verified in-session
 unless marked otherwise. Read this file, then `README_GPU.md`.
 
 ## 0. Deadline, deliverable, rules
@@ -76,6 +76,28 @@ runs/ (git-ignored)  trackB/, trackB_noconc/, nn/ (Stage 1+2 npz files), smoke*/
 7. Refuted (measured by the design agents on Track B artefacts): recency weighting (forward-9 much worse with recent
    batches only), kNN / RBF-SVM / boosting members (.57 / .75 on batch 9, non-diverse), pattern-only features,
    a linear Ethanol-vs-Acetaldehyde expert.
+
+## 2b. Final results (2026-09-05 ~23:30, 3 seeds, seed-averaged; `reports/nn_compare.csv`, `reports/blend_*.json`)
+
+| member | score_ot (6/7/8/9 w 1/2/1/2) | b9 | b7 | unforced test histogram |
+|---|---|---|---|---|
+| nn:a9b | .9866 | .989 | .999 | Ethanol-heavy (~780) |
+| nn:a9s | .9853 | .990 | .999 | 657/535/667/605/540/596 |
+| nn:a9t | .979 | .990 | .999 | Ethanol-heavy |
+| nn:a3 / a5b / a7b | .973 / .969 / .959 | .968–.990 | .972–.983 | Ethanol-heavy |
+| trackB:ens_cbstb | .982 (post) | .980 | .998 | 621/562/650/646/538/583 |
+
+Candidate blends (all folds 6–9 post-assignment; `scripts/45_candidates.py`):
+
+| candidate | score_post | b9 | hist_l1 pre | moved | agree Track B | members |
+|---|---|---|---|---|---|---|
+| **final_hc_t05_v1 = submissions/submission_final.csv** | **.9906** | .998 | **.081** | .047 | .758 | a9s .29, a5b .29, a9b .14, a7b .14, ens_cbstb .14; Sinkhorn τ=0.5 |
+| final_hc_t1_v1 = submission_alternate.csv | .9894 | .993 | .086 | .033 | .781 | 9 members (a9s .31, ens_cbstb .15, rest .08); τ=1 |
+| final_eq_t1_v1 (equal weights) | .9883 | .991 | .154 | .066 | .788 | 9 members equal |
+| sub_trackB_ot_v1.csv (fallback) | .982 | .980 | .065 | .062 | – | Track B ens_cbstb + assignment |
+
+The NN-led candidates agree with each other on 94–98 % of test rows and with Track B on ~76–79 %; the final and
+alternate differ on 197 rows. Final post-assignment histogram 602/572/605/603/613/605.
 
 ## 3. How to produce the submission
 
