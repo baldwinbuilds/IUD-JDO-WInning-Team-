@@ -1,0 +1,17 @@
+name: drift
+channels: [conda-forge]
+dependencies:
+  - python=3.11
+  - pandas>=2.2
+  - numpy>=1.26
+  - scipy>=1.13
+  - scikit-learn>=1.5
+  - matplotlib
+  - seaborn
+  - pip
+  - pip:
+      - optuna>=3.6
+      - lightgbm>=4.3
+      - pot>=0.9
+# torch: GPU box -> pip install torch --index-url https://download.pytorch.org/whl/cu124
+#        CPU box -> pip install torch --index-url https://download.pytorch.org/whl/cpu

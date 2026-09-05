@@ -1,0 +1,6 @@
+data/
+runs/
+__pycache__/
+*.pyc
+.impeccable/
+reports/*.png
