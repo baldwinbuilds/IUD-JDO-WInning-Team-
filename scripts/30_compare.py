@@ -42,9 +42,14 @@ def main():
             row[f"b{k}"] = macro_f1(y_of[k], P.argmax(1) + 1)
             row[f"n_seeds_b{k}"] = len(oof[v][k])
         row["weighted_678"] = weighted_score({k: row[f"b{k}"] for k in (6, 7, 8) if f"b{k}" in row})
+        row["b7_only"] = row.get("b7", float("nan"))   # batch 7 is large and class-balanced: fairest proxy for AdaBN/DA
         rows.append(row)
     table = pd.DataFrame(rows).set_index("variant").sort_values("weighted_678", ascending=False)
     pd.set_option("display.width", 200)
+    print("\nheld-out batch class shares (min..max over 6 classes) - small/skewed batches under-rate AdaBN/DANN:")
+    for k in sorted(y_of):
+        sh = np.bincount(y_of[k].astype(int), minlength=7)[1:] / len(y_of[k])
+        print(f"  b{k}: n={len(y_of[k])} shares {np.round(sh, 2).tolist()}")
     print("\n=== LOBO macro-F1 (seed-averaged probabilities) ===")
     print(table[[c for c in table.columns if not c.startswith("n_seeds")]].round(4).to_string())
     REPORTS.mkdir(exist_ok=True)

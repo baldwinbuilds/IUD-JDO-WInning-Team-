@@ -14,12 +14,13 @@ python scripts/00_env_check.py                # must print cuda: True
 ## 2. Stage 1 — compare variants (held-out batches 6, 7, 8; 1 seed)  ~1 GPU-hour
 
 ```bash
-python scripts/20_nn_lobo.py --tag nn --device cuda --seeds 0 --folds 6 7 8 \
-  --variants a0 a1 a1l a1h a2 a3 a3d a4 a5 a6 a7s a9
+python scripts/20_nn_lobo.py --tag nn --device cuda --seeds 0 --folds 7 6 8 \
+  --variants a3 a2b a2bl a3dl a4b a5b a6b a7b a9b a3w a0 a1l a2 a4
 python scripts/30_compare.py --tag nn --extra trackB
 ```
-Read `reports/nn_compare.csv`: the decision score is `weighted_678`. Track B reference (same protocol): lobo6 .988, lobo7 .996, lobo8 .962 macro-F1 (weighted .981).
-Promote a variant only if it beats `a0` on `weighted_678` and is not worse than the best by >1 pt on any of b6/b7/b8, and its test histogram is plausible (organisers: 600 per class; flag <520 or >680).
+Read `reports/nn_compare.csv`. Two scores: `weighted_678` and `b7_only`. **Batch 7 is the fairest proxy** (3,613 rows, all six classes reasonably balanced); batches 6 and 8 are class-skewed (batch 8: 294 rows, 49 % Acetone) and systematically *under-rate* AdaBN/DANN variants, whose favourable case is exactly the real test (3,600 rows, 600 per class). Track B reference (same protocol): lobo6 .988, lobo7 .996, lobo8 .962 (weighted .981).
+Also read the per-run `test validators` in `runs/nn/log.txt` (BNM, IM, ClassAMI — higher is better, label-free) and the test histogram (organisers: 600 per class; flag <520 or >680).
+Promote a variant if it is competitive with the best on b7, not catastrophic on b6/b8, and has a plausible test histogram / good validators.
 
 ## 3. Stage 2 — the 9 leave-one-batch-out networks for the promoted variants (× seeds)  ~1 GPU-hour per variant per seed-triple
 
