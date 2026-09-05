@@ -1,17 +1,23 @@
 # Cheatsheet — gas-sensor drift classification (batches 1–9 → batch 10)
 
-A guide for redoing the whole pipeline by hand. Every code block below was run end-to-end on this machine
-(`.venv/Scripts/python.exe`, numpy/pandas/scikit-learn/scipy; torch only for §10) and reproduces the numbers quoted.
-"Batch 9 .968 → .980" always means macro-F1 on held-out batch 9, before → after the balanced assignment.
+A guide for redoing the pipeline by hand **using only the competition files** (`train.csv`, `test.csv`,
+`sample_submission.csv`, the overview text). Every claim about the data below is derived from those files with the code
+shown; every code block was run end-to-end on this machine (`.venv/Scripts/python.exe`, numpy/pandas/scikit-learn/scipy;
+torch only for §10) and reproduces the numbers quoted. "Batch 9 .968 → .980" always means macro-F1 on held-out batch 9,
+before → after the balanced assignment.
+
+Provenance note: an earlier version of this file described the eight descriptors with physical names taken from prior
+knowledge of similar sensor datasets. That is outside information and has been removed. The descriptors are now
+called d0–d7 and characterised only by what the competition data shows (§1b). No external data or labels were ever used.
 
 ---
 
 ## 0. The whole recipe in ten lines
 
-1. Understand the 128 features as 16 sensors × 8 descriptors; batches are time; batch 10 is far drifted.
+1. Understand the 128 features as 16 sensors × 8 descriptors (stated in the data dictionary; the layout is confirmed from the data, §1b); batches are time; batch 10 is far drifted.
 2. Clean nothing; check everything (3,600 test rows, id order, no NaN/inf, class counts per batch).
 3. Validate with leave-one-batch-out; **batch 9 is the only proxy that behaves like the test**; batch 7 is the big sanity fold.
-4. Build drift-robust features: L1-normalised sensor pattern, log scale, log concentration, sensor-state `S = ΔR/(ratio−1)`.
+4. Build scale-free features: sensor pattern normalised per descriptor, log magnitude, log concentration, plus a per-sensor ratio of the two large descriptors.
 5. Baselines: shrinkage LDA and logistic regression on standardised features (batch 9 ≈ .73 / .88).
 6. Turn "600 rows per class" into a **Sinkhorn balanced assignment** of test rows to classes (batch 9 .909 → .973 for the ensemble).
 7. Self-train on the unlabeled target, but pick pseudo-labels from the **balanced** posterior (batch 9 .968 / .980; test histogram balanced).
@@ -23,19 +29,10 @@ A guide for redoing the whole pipeline by hand. Every code block below was run e
 
 ## 1. Understand the data before touching a model
 
-**Columns.** `measurement_id`, `batch` (1–9 train, 10 test), `concentration` (ppm), `feat_1 … feat_128`, `gas_class` (train only).
-Feature index = `sensor*8 + d` for sensor 0–15 and descriptor d:
-
-| d | descriptor | meaning | drift behaviour |
-|---|---|---|---|
-| 0 | ΔR | steady-state resistance change (magnitude) | drifts a lot (scale) |
-| 1 | ratio | normalised ΔR (R/R0-type) | drifts with sensor age |
-| 2–4 | EMAi 0.001 / 0.01 / 0.1 | rising-edge transient maxima | shape is more stable than magnitude |
-| 5–7 | EMAd 0.001 / 0.01 / 0.1 | decaying-edge transient minima (negative) | shape is more stable than magnitude |
-
-Reshape to a cube: `cube = df[FEAT].to_numpy().reshape(n, 16, 8)`.
-
-**Classes.** 1 Ethanol, 2 Ethylene, 3 Ammonia, 4 Acetaldehyde, 5 Acetone, 6 Toluene. Metric macro-F1 (every class counts equally).
+**Given by the competition.** `measurement_id`, `batch` (1–9 train, 10 test, chronological), `concentration`,
+`feat_1 … feat_128` = "eight response descriptors for each of 16 chemical sensors", `gas_class` 1–6
+(1 Ethanol, 2 Ethylene, 3 Ammonia, 4 Acetaldehyde, 5 Acetone, 6 Toluene). Metric macro-F1. The hidden test has
+**600 rows per class** (stated). Rules: do not identify the source dataset, no external data, do not recover labels.
 
 **Per-batch class counts** (rows = batch; class 1..6):
 
@@ -47,34 +44,58 @@ b4  64/ 43/ 12/ 30/ 12/  0      b9  61/ 55/100/ 75/ 78/101   <- most recent, bal
 b5  28/ 40/ 20/ 46/ 63/  0      test 600 x 6 (stated)
 ```
 
-**Facts that shaped every decision**
+**Facts that shaped every decision (all measured on the competition files)**
 
 - Batches 6/7/8 are easy for anything decent (.96–.99); batch 9 is not (raw LDA .73). Batch 10 is 2–3× further from
   the training cloud than batch 9 (nearest-neighbour distance in pattern space), so expect real scores well below proxies.
-- Concentration is class-specific in train (Toluene ≤ 230 ppm, Ammonia up to 1000, Acetone ≤ 500). The test has
-  800 rows at 400–1000 ppm and 140 at 1–2.5 ppm. Concentration is a legitimate feature, but it extrapolates on batch 10.
-- The organisers state 600 rows per class. That is a *known class marginal* — the single most valuable piece of information.
-- The test rows are in acquisition order and the concentration sequence repeats in programmes. **Never** use row
+- Concentration is class-specific in train (`train.groupby("gas_class").concentration.agg(["min","median","max"])`:
+  Toluene ≤ 230, Ammonia up to 1000, Acetone ≤ 500). The test has 800 rows at 400–1000 and 140 at 1–2.5. Concentration
+  is a legitimate feature, but it extrapolates on batch 10.
+- The 600-per-class statement is a *known class marginal* — the single most valuable piece of information.
+- Test rows are in acquisition order and the concentration sequence repeats in programmes. **Never** use row
   position / `measurement_id` for prediction (rules) — only for reading and writing the CSV.
 
-**EDA worth 20 minutes**
+### 1b. Working out the descriptor structure from the data alone
+
+The data dictionary says 16 sensors × 8 descriptors but not the order or the meaning. Three cheap checks settle what
+you need:
 
 ```python
-train.groupby("batch").gas_class.value_counts().unstack()          # the table above
-train.groupby("gas_class").concentration.agg(["min", "median", "max"])
-np.log1p(np.abs(cube[:, :, 0])).mean(1)                            # response magnitude per row: plot by batch -> drift
-# sensor state S = dR/(ratio-1): its per-batch median drifts monotonically with sensor age
+X = train[FEAT].to_numpy(float)
+pos = (X > 0).mean(0)                                   # fraction of positive values per column
+print(np.round(pos[:16], 2))                             # [1 1 1 1 1 0 0 0  1 1 1 1 1 0 0 0]
+print(np.allclose(pos.reshape(16, 8), pos.reshape(16, 8)[0], atol=0.02))   # True -> period-8 layout
+cube = X.reshape(len(X), 16, 8)                         # (rows, sensor, descriptor d0..d7)
+for d in range(8):                                      # sign, size, and co-movement with d0
+    print(d, (cube[:, :, d] > 0).mean().round(3), np.median(np.abs(cube[:, :, d])).round(2),
+          np.mean([np.corrcoef(np.log1p(np.abs(cube[:, s, d])), np.log1p(np.abs(cube[:, s, 0])))[0, 1] for s in range(16)]).round(2))
 ```
+
+Result (train.csv):
+
+| position | sign | median size | corr with log\|d0\| | what the data says |
+|---|---|---|---|---|
+| d0 | + (99.8 %) | 13 000 | 1.00 | the large "response magnitude" of the sensor |
+| d1 | + (≥ 0.993, median 3.7) | 3.7 | .75 | a normalised magnitude, never below ~1 |
+| d2, d3, d4 | + | 3.8, 7.2, 10.4 | .88, .78, .71 | a positive family, ordered \|d2\| < \|d3\| < \|d4\| in 99.9 % of rows |
+| d5, d6, d7 | − | 2.5, 3.9, 9.2 | .91, .87, .63 | a negative family, ordered \|d5\| < \|d6\| < \|d7\| in 99.8 % of rows |
+
+So each sensor block is: one big magnitude, one normalised magnitude, two ordered triplets of smaller descriptors that
+all scale with the magnitude. That is all the feature engineering needs: (a) divide by a scale to get a fingerprint,
+(b) keep the scale separately, (c) ratios inside a sensor block are scale-free shape descriptors. The 8-per-sensor
+layout also tells you that "sensor-major 16×8" reshape above is correct (a 1-D CNN over sensors uses it).
+
+Do **not** try to name the descriptors physically; nothing in the pipeline needs it.
 
 ---
 
 ## 2. Cleaning (there is almost nothing to clean)
 
-- No missing values, no duplicates, no inf in either file. Do **not** drop "outliers": the high-response rows are real.
+- No missing values, no duplicates, no inf in either file. Do **not** drop "outliers": the high-magnitude rows are real.
 - Check the test file has exactly **3,600** rows (`G_B10_0001 … G_B10_3600`) and the same ids as `sample_submission.csv`,
   in the same order. (A partial 2,288-row copy existed for a while — that cost time.)
 - Force numeric dtypes, keep `batch` as an id, never as a model feature.
-- The only "imputation": masked sensor-state cells (see §5) are filled with the **training** median of that sensor.
+- The only "imputation": masked cells of the derived state feature (§4) are filled with the **training** median.
 
 ---
 
@@ -100,15 +121,15 @@ import numpy as np, pandas as pd
 FEAT = [f"feat_{i}" for i in range(1, 129)]
 
 def features(df, state_fill=None):
-    cube = df[FEAT].to_numpy(float).reshape(len(df), 16, 8)     # (rows, sensors, descriptors)
-    dr, ratio = cube[:, :, 0], cube[:, :, 1]
+    cube = df[FEAT].to_numpy(float).reshape(len(df), 16, 8)     # (rows, sensors, descriptors d0..d7)
+    d0, d1 = cube[:, :, 0], cube[:, :, 1]
     l1 = np.abs(cube).sum(axis=1, keepdims=True) + 1e-6          # per-descriptor L1 over the 16 sensors
     pattern = (cube / l1).reshape(len(df), -1)                   # 128 scale-free "fingerprint" values
-    logscale = np.log1p(np.abs(dr)).mean(axis=1, keepdims=True)  # overall response magnitude
+    logscale = np.log1p(np.abs(d0)).mean(axis=1, keepdims=True)  # overall response magnitude
     logconc = np.log(df["concentration"].to_numpy(float))[:, None]
     with np.errstate(divide="ignore", invalid="ignore"):
-        S = dr / (ratio - 1.0)                                   # sensor-state proxy (baseline resistance)
-        logS = np.log(np.where((dr > 0) & (ratio > 1.02) & (S > 0), S, np.nan))
+        S = d0 / (d1 - 1.0)                                      # per-sensor ratio of the two large descriptors
+        logS = np.log(np.where((d0 > 0) & (d1 > 1.02) & (S > 0), S, np.nan))   # guard: d1 can sit at ~1
     if state_fill is None:
         state_fill = np.nanmedian(logS, axis=0)                  # learned on TRAIN only
     logS = np.where(np.isfinite(logS), logS, state_fill)
@@ -116,22 +137,29 @@ def features(df, state_fill=None):
     return X, state_fill
 ```
 
-Why each block:
-
-| block | dims | idea |
+| block | dims | idea (derived from §1b) |
 |---|---|---|
-| `pattern` | 128 | which sensors respond relative to the others — the gas fingerprint, independent of overall scale |
-| `logscale` | 1 | how strongly the array responded (concentration × sensitivity) |
-| `logconc` | 1 | concentration is informative in-distribution; risky at 400–1000 ppm on the test |
-| `logS`, centred `logS` | 32 | sensor state (baseline) — invariant to gas *within* a batch, tracks drift *between* batches |
-| (NN only) `slog` = sign(x)·log1p\|x\| of the raw 128, and `shape` = log(EMA/\|ΔR\|) ratios and −EMAd/EMAi asymmetries | 128 + 96 + 48 | transient-shape features separate Ethanol/Acetaldehyde; they hurt the *linear* model (.981 → .968) but help the NN |
+| `pattern` | 128 | which sensors respond relative to the others, per descriptor — a fingerprint independent of overall scale |
+| `logscale` | 1 | how strongly the array responded overall |
+| `logconc` | 1 | concentration is informative in-distribution; risky at 400–1000 on the test |
+| `logS`, sensor-centred `logS` | 32 | `d0/(d1−1)` per sensor: its batch-level median drifts with time (sensor-0 medians 9.8 → 6.9 over batches 1–9), so it carries "sensor state"; kept because the ablation below says so, not because of any physical story |
+| (NN only) signed-log of the raw 128, and "shape" = log(\|d2..d7\| / \|d0\|) plus the pairwise ratio of the negative family to the positive family | 128 + 96 + 48 | scale-free within-sensor shape; they hurt the *linear* model (.981 → .968) but help the NN |
 
-Scaling: `StandardScaler` fitted on the training rows for linear models. For the NN use a
-`QuantileTransformer(output_distribution="normal")` fitted on **train + test pooled** (legitimate: unlabeled test
-features only) — it maps everything onto the same marginal and removes scale drift.
+**Ablation, honest version** (linear recipe of §8 with self-training under the marginal; batch 9 / batch 7, argmax →
+after assignment):
 
-Refuted feature ideas: pattern-only (no gain on batch 9), dropping the sensor-state block (it is what makes the
-transductive methods work), dropping concentration (no proxy change, slightly higher agreement with the NN — kept).
+| feature set | batch 9 | batch 7 |
+|---|---|---|
+| full (pattern + logscale + logconc + state) | .968 → **.980** | .998 → .999 |
+| without the state block | .976 → .972 | .996 → .997 |
+| without log concentration | .968 → .980 | .997 → .999 |
+| raw signed-log instead of pattern | .975 → .978 | .994 → .993 |
+| pattern only | .971 → .969 | .995 → .999 |
+
+Read: once the marginal-aware adaptation is in place the feature choice moves batch 9 by ≈ 1 point. Any of these is a
+fine starting point; the full set is best by a small margin. Scaling: `StandardScaler` on training rows for linear
+models; for the NN a `QuantileTransformer(output_distribution="normal")` fitted on **train + test pooled** (legitimate:
+unlabeled test features only) removes scale drift.
 
 ---
 
@@ -141,14 +169,14 @@ transductive methods work), dropping concentration (no proxy change, slightly hi
 from sklearn.discriminant_analysis import LinearDiscriminantAnalysis
 from sklearn.linear_model import LogisticRegression
 from sklearn.preprocessing import StandardScaler
-lda = lambda: LinearDiscriminantAnalysis(solver="lsqr", shrinkage="auto")   # shrinkage matters (434 dims, 10k rows)
+lda = lambda: LinearDiscriminantAnalysis(solver="lsqr", shrinkage="auto")   # shrinkage matters (162 dims, 10k rows)
 lr  = lambda: LogisticRegression(C=1.0, max_iter=5000)
 ```
 
-Expected LOBO macro-F1 (argmax): batch 7 ≈ .99 for both; batch 9 LDA .73, LR .88. LDA is the drift-fragile one but
-the better-calibrated-within-batch one; LR is the robust one. LDA is **over-confident under drift** (median max-prob
-.998 on the test while being wrong on ~25 % of rows) — never trust its probabilities as confidence, and expect
-temperature scaling to give T ≈ 1.2–3 for LDA-based members vs T ≈ 0.3–0.6 for label-smoothed NNs.
+Expected LOBO macro-F1 (argmax): batch 7 ≈ .99 for both; batch 9 LDA .73, LR .88. LDA is the drift-fragile one; LR
+the robust one. LDA is **over-confident under drift** (median max-prob .998 on the test while wrong on ~25 % of rows) —
+never use its probabilities as confidence; temperature scaling gives T ≈ 1.2–3 for LDA-based members vs ≈ 0.3–0.6 for
+label-smoothed NNs.
 
 ---
 
@@ -156,8 +184,8 @@ temperature scaling to give T ≈ 1.2–3 for LDA-based members vs T ≈ 0.3–0
 
 On the test the raw models predicted 928 Ethanol / 413 Acetaldehyde (should be 600/600). Diagnostics that showed it:
 
-- Predicted histogram vs 600/class (`np.bincount(pred)`), and an EM estimate of the class prior (Saerens 2002) — both
-  said "Ethanol ≫ Acetaldehyde".
+- Predicted histogram vs 600/class (`np.bincount(pred)`), and an EM estimate of the class prior — both said
+  "Ethanol ≫ Acetaldehyde".
 - The runner-up class of the Ethanol-predicted rows was Acetaldehyde for 702 of 928 rows.
 - Plain class-balanced self-training made it *worse* (raw LDA 650 Acetaldehyde → 441): selecting the top-k *per
   predicted class* freezes whatever skew the model already has.
@@ -248,7 +276,7 @@ iteration, 10 iterations. Batch 9 .96; unforced test histogram 714/553/548/658/5
 ## 9. What the two families disagree about (know this before blending)
 
 The linear ensemble and the neural nets agree on only ~77 % of test rows even though both are ≥ .98 on every proxy.
-Disagreement lives at 10–250 ppm (25–28 % of rows there; 8 % at ≥ 400 ppm) in the pairs Acetaldehyde↔Toluene,
+Disagreement lives at concentrations 10–250 (25–28 % of rows there; 8 % at ≥ 400) in the pairs Acetaldehyde↔Toluene,
 Acetaldehyde↔Ammonia, Ethanol↔Acetaldehyde. No proxy can arbitrate it; the blend and the label-free checks are the hedge.
 
 ---
@@ -351,8 +379,8 @@ right *before* the target is trained in, wrong *after*.
 Practical: one 150-epoch run ≈ 20–40 s on an RTX 3060 Ti (self-training ≈ 4× that); use 3 seeds; average test
 probabilities over all fold models (models trained on all 9 batches count double). Keep `torch.set_num_threads(2)`
 so a GPU job does not pin the CPU. Variants that lost on every proxy and are not worth re-running: DANN/CDAN/CORAL
-domain-adversarial losses, a TabM ensemble (no BatchNorm → no AdaBN), wider MLPs. A 1-D CNN over the 16 sensors is a
-reasonable diversity member (batch 9 .96).
+domain-adversarial losses, a TabM ensemble (no BatchNorm → no AdaBN), wider MLPs. A 1-D CNN over the 16 sensors
+(channels = the 8 descriptors) is a reasonable diversity member (batch 9 .96).
 
 ---
 
@@ -408,7 +436,7 @@ print(np.bincount(sub.gas_class, minlength=7)[1:])          # every class 520-68
 | final calibrated blend + assignment τ=0.5 | .998 | .999 | 667/533/679/599/536/586 → 602/572/605/603/613/605 |
 
 Real batch-10 macro-F1 is unknown until the leaderboard; expect it well below the proxies (the families still
-disagree on ~22 % of rows). Earlier literature-style baselines for a plain MLP on such a batch are ~.72–.74.
+disagree on ~22 % of rows).
 
 ---
 
@@ -440,7 +468,7 @@ disputed rows.
 - **LOBO** leave-one-batch-out validation. **Proxy** a held-out training batch standing in for the test batch.
 - **Marginal** the vector of class counts (600 × 6 on the test). **Sinkhorn** iterative scaling that finds the
   entropic optimal-transport plan between rows and classes under a given marginal.
-- **AdaBN** re-estimating BatchNorm mean/variance on the target data at inference. **SWA / running statistics** the
+- **AdaBN** re-estimating BatchNorm mean/variance on the target data at inference. **Running statistics** the
   BatchNorm buffers accumulated during training.
 - **Self-training / pseudo-labels** retraining with confident target rows labelled by the model (here: by the balanced posterior).
 - **Temperature T** divides log-probabilities before softmax; T > 1 softens, T < 1 sharpens.

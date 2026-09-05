@@ -10,8 +10,11 @@ import numpy as np
 import pandas as pd
 
 FEAT_COLS = [f"feat_{i}" for i in range(1, 129)]
-TYPE_NAMES = ["DR", "ratio", "EMAi001", "EMAi01", "EMAi1", "EMAd001", "EMAd01", "EMAd1"]
-# sensor groups inferred from the log|DR| correlation structure (0-indexed sensors)
+TYPE_NAMES = ["d0", "d1", "d2", "d3", "d4", "d5", "d6", "d7"]   # descriptor positions within each sensor block
+# Data-derived structure (competition files only): the 128 features repeat with period 8 (16 sensors x 8 descriptors);
+# d0 = large positive magnitude, d1 = a normalised magnitude (>= 1), d2-d4 = positive family with |d2|<|d3|<|d4|,
+# d5-d7 = negative family with |d5|<|d6|<|d7|; all six co-vary with d0.
+# sensor groups inferred from the log|d0| correlation structure (0-indexed sensors)
 GROUPS = [[0, 1, 8, 9], [2, 3, 10, 11], [4, 5, 12, 13], [6, 7, 14, 15]]
 ALL_BLOCKS = ("slog", "pattern", "logscale", "logconc", "state", "shape", "typemed")
 DEFAULT_LINEAR = ("pattern", "logscale", "logconc", "state")
@@ -28,9 +31,10 @@ def signed_log(x: np.ndarray) -> np.ndarray:
 
 
 def sensor_state(cube: np.ndarray) -> np.ndarray:
-    """S = DR/(ratio-1): empirically invariant to gas and concentration within a batch.
+    """S = d0/(d1-1): a per-sensor quantity built from the two large descriptors; its batch-level median drifts
+    with time and its log (raw and sensor-centred) helps the linear models on the drifted proxy (ablation-tested).
 
-    Returns (n, 16) with NaN where undefined (DR <= 0 or ratio <= 1.02).
+    Returns (n, 16) with NaN where undefined (d0 <= 0 or d1 <= 1.02).
     """
     dr, ratio = cube[:, :, 0], cube[:, :, 1]
     with np.errstate(divide="ignore", invalid="ignore"):
@@ -85,9 +89,9 @@ class FeatureBuilder:
                 parts.append(logS - logS.mean(axis=1, keepdims=True))
             elif b == "shape":
                 denom = absdr[:, :, None] + EPS
-                ratios = cube[:, :, 2:8] / denom                      # 6 dynamic descriptors / |DR|
+                ratios = cube[:, :, 2:8] / denom                      # 6 small descriptors / |d0| (scale-free shape)
                 parts.append(np.clip(signed_log(ratios), -20, 20).reshape(n, -1))
-                asym = -cube[:, :, 5:8] / (cube[:, :, 2:5] + EPS)     # -EMAd_a / EMAi_a
+                asym = -cube[:, :, 5:8] / (cube[:, :, 2:5] + EPS)     # negative family / positive family, pairwise
                 parts.append(np.clip(signed_log(asym), -20, 20).reshape(n, -1))
             elif b == "typemed":
                 med = np.stack([np.median(logdr[:, g], axis=1) for g in GROUPS], axis=1)
