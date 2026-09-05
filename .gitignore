@@ -1,6 +1,12 @@
-data/
-runs/
+# shared
 __pycache__/
 *.pyc
+.venv/
+# Baldwin V1 pipeline artefacts
+train_clean.csv
+test_clean.csv
+# drift pipeline (src/drift, scripts/)
+data/
+runs/
 .impeccable/
 reports/*.png
