@@ -1,44 +1,56 @@
-# Running the NN track on the GPU machine
+# Running the pipeline on the GPU machine
 
-The whole folder is self-contained (data in `data/`). Copy it (OneDrive sync or zip) and run from the folder root.
+Self-contained folder (data in `data/`; the venv interpreter is `.venv/Scripts/python.exe`, torch 2.11 cu128).
+See `HANDOFF.md` for the state of the project and the reasoning behind the protocol.
 
-## 1. Environment (once)
-
-```bash
-conda env create -f environment.yml          # or: conda create -n drift python=3.11 pandas numpy scipy scikit-learn
-conda activate drift
-pip install torch --index-url https://download.pytorch.org/whl/cu124   # pick the CUDA build for your driver
-python scripts/00_env_check.py                # must print cuda: True
-```
-
-## 2. Stage 1 — compare variants (held-out batches 6, 7, 8; 1 seed)  ~1 GPU-hour
+## 1. Environment check
 
 ```bash
-python scripts/20_nn_lobo.py --tag nn --device cuda --seeds 0 --folds 7 6 8 \
-  --variants a3 a2b a2bl a3dl a4b a5b a6b a7b a9b a3w a0 a1l a2 a4
-python scripts/30_compare.py --tag nn --extra trackB
+.venv/Scripts/python.exe scripts/00_env_check.py          # must print torch ... and cuda True
 ```
-Read `reports/nn_compare.csv`. Two scores: `weighted_678` and `b7_only`. **Batch 7 is the fairest proxy** (3,613 rows, all six classes reasonably balanced); batches 6 and 8 are class-skewed (batch 8: 294 rows, 49 % Acetone) and systematically *under-rate* AdaBN/DANN variants, whose favourable case is exactly the real test (3,600 rows, 600 per class). Track B reference (same protocol): lobo6 .988, lobo7 .996, lobo8 .962 (weighted .981).
-Also read the per-run `test validators` in `runs/nn/log.txt` (BNM, IM, ClassAMI — higher is better, label-free) and the test histogram (organisers: 600 per class; flag <520 or >680).
-Promote a variant if it is competitive with the best on b7, not catastrophic on b6/b8, and has a plausible test histogram / good validators.
 
-## 3. Stage 2 — the 9 leave-one-batch-out networks for the promoted variants (× seeds)  ~1 GPU-hour per variant per seed-triple
+## 2. Track B (linear, CPU, ~140 s)
 
 ```bash
-python scripts/20_nn_lobo.py --tag nn --device cuda --seeds 0 1 2 --folds 1 2 3 4 5 6 7 8 9 0 \
-  --variants <promoted, e.g. a3d a7s a9>
-python scripts/30_compare.py --tag nn --extra trackB
+.venv/Scripts/python.exe scripts/10_lda_track.py --force
 ```
-`--folds 0` = fit on all 9 batches with the test as the only unlabeled target (extra ensemble member).
-Every run writes `runs/nn/<variant>_fold<k>_seed<s>.npz` (OOF probs on batch k + test probs) and appends to `runs/nn/log.txt`; re-running skips existing files (`--overwrite` to redo).
+Writes `runs/trackB/{oof_lobo1..9,oof_fwd7..9,test_probs}.npz`, `reports/trackB_lobo.csv`,
+`submissions/sub_trackB_v1.csv` (argmax of the selected variant) and `submissions/sub_trackB_ot_v1.csv`
+(after the balanced 600-per-class assignment — the fallback submission).
+Variants: `lda, lr, lda_cbst, lr_cbst, ens_cbst, ens_cbst_prop` (plain) and `lda_cbstb, lr_cbstb, ens_cbstb`
+(self-training under the known marginal), `lda_em` (class-mean EM with fixed prior), `em_ensb`.
+Every variant is scored by argmax and `+ot` (after assignment with the held-out batch's true counts as marginal).
 
-## 4. Optional knobs
+## 3. NN track (GPU)
 
-* `--epochs N` (default 150), `--blocks ...` to ablate feature blocks (default: slog pattern logscale logconc state shape).
-* Add variants in `scripts/20_nn_lobo.py::VARIANTS` (arch mlp|tabm|cnn, da none|dann|cdan|coral, lam_max, adabn, selftrain_rounds, sinkhorn).
+```bash
+# variant comparison / full matrix: folds 9 and 7 are the proxies that matter, 6 and 8 are guards, 0 = fit on all 9 batches
+.venv/Scripts/python.exe scripts/20_nn_lobo.py --tag nn --device cuda --seeds 0 1 2 --folds 9 7 6 8 0 \
+    --variants a3 a9s a9t a7b a9b a5b
+.venv/Scripts/python.exe scripts/30_compare.py --tag nn --extra trackB
+```
+Variant meanings (`scripts/20_nn_lobo.py::VARIANTS`): a0 plain MLP; a3 +per-domain AdaBN; a5b 1-D CNN+AdaBN;
+a7b AdaBN + 1 self-training round; a9b/a9s/a9t AdaBN teacher + 3 Sinkhorn self-training rounds (a9b: rank by
+model probability, τ=0.1; a9s: rank by balanced posterior, τ=0.4, fractions .5/.7/.9; a9t: same with τ=1);
+a6 TabM (no BatchNorm, no AdaBN); a1l/a2/a4/a2b/a2bl/a3dl/a4b adversarial or CORAL alignment (all lost — do not rerun).
+Self-trained variants read out running BN statistics; the AdaBN read-out is stored as `alt_adabn_*` and appears
+as `<variant>@adabn` in `30_compare.py` (`--no-alts` hides it) and in the blend with `--alts`.
+Each run appends to `runs/nn/log.txt` (held-out F1, alternative read-outs, per-round reassignments/agreement,
+test histogram, validators). Existing npz files are skipped (`--overwrite` to redo). `--threads 2` is the default
+so the GPU job does not hog the CPU.
 
-## 5. Bring results back
+## 4. Blend and submit
 
-Copy `runs/nn/` (and `reports/`) back to the main machine; `scripts/40_blend_submit.py` blends the promoted models with Track B on the batch 6–8 OOF predictions and writes the submission.
+```bash
+.venv/Scripts/python.exe scripts/40_blend_submit.py --name final
+#   --nn a9s a3          restrict NN members     --alts    also offer @adabn read-outs
+#   --no-nn              Track B only            --assign hungarian|none   --tau 1.0   --hist-penalty 0.05
+#   --test-models lobo|fold0   which nets' test predictions are averaged     --force   ignore the gates
+```
+Prints per-member post/pre-assignment macro-F1 per fold (6/7/8/9), fitted temperatures, the hill-climb result,
+pre/post test histograms, the flow matrix, moved fraction and member agreement; writes
+`submissions/sub_<name>_vN.csv`, `reports/blend_<name>_vN.json`, `runs/blend_<name>_vN_test_probs.npy`
+(never overwrites an existing version).
 
-Rules reminder: nothing in this pipeline uses `measurement_id` order or test labels; test *features* are used only as unlabeled domain-adaptation data.
+Rules reminder: nothing here uses `measurement_id` order or test labels; test *features* are used only as
+unlabeled adaptation data, and the 600-per-class statement only as a class marginal.
